@@ -74,6 +74,7 @@ class GPTQQuantizer(object):
         batch_size: int = 1,
         pad_token_id: Optional[int] = None,
         disable_exllama: bool = False,
+        disable_marlin: bool = True,
         exllama_config: Dict[str, Any] = None,
         max_input_length: Optional[int] = None,
         cache_block_outputs: Optional[bool] = True,
@@ -145,6 +146,7 @@ class GPTQQuantizer(object):
         self.batch_size = batch_size
         self.pad_token_id = pad_token_id
         self.disable_exllama = disable_exllama
+        self.disable_marlin = disable_marlin
         self.exllama_config = exllama_config
         self.max_input_length = max_input_length
         self.quant_method = QuantizationMethod.GPTQ
@@ -227,6 +229,7 @@ class GPTQQuantizer(object):
                     )
                     del layers_to_be_replaced[name]
         self._replace_by_quant_layers(model, layers_to_be_replaced)
+
         return model
 
     def get_no_split_module_classes(self, model):
@@ -789,3 +792,170 @@ def load_quantized_model(
     model.quantization_method = QuantizationMethod.GPTQ
     model.eval()
     return model
+
+# for loading of marlin checkpoint without dispatching and post_init
+# to be used in PreTrainedModel.from_pretrained
+def replace_marlin_linear_and_load_checkpoint(
+    model,
+    model_name_or_path,
+    # quantize_config_dict,
+    torch_dtype,
+    device_map,
+    disable_exllama: bool = False,
+    exllama_config: Optional[Dict[str, Any]] = None,
+    use_safetensors: bool = True,
+    offload_state_dict=None,
+    **kwargs,
+):
+    # taken BaseGPTQForCausalLM.from_quantized
+    cache_dir = kwargs.pop("cache_dir", None)
+    force_download = kwargs.pop("force_download", False)
+    resume_download = kwargs.pop("resume_download", False)
+    proxies = kwargs.pop("proxies", None)
+    local_files_only = kwargs.pop("local_files_only", False)
+    use_auth_token = kwargs.pop("use_auth_token", None)
+    revision = kwargs.pop("revision", None)
+    subfolder = kwargs.pop("subfolder", "")
+    commit_hash = kwargs.pop("_commit_hash", None)
+
+    cached_file_kwargs = {
+        "cache_dir": cache_dir,
+        "force_download": force_download,
+        "proxies": proxies,
+        "resume_download": resume_download,
+        "local_files_only": local_files_only,
+        "use_auth_token": use_auth_token,
+        "revision": revision,
+        "subfolder": subfolder,
+        "_raise_exceptions_for_missing_entries": False,
+        "_commit_hash": commit_hash,
+    }
+
+    # handle the quanziation config
+    from auto_gptq import BaseQuantizeConfig
+    quantize_config = BaseQuantizeConfig.from_pretrained(model_name_or_path)
+
+    # taken BaseGPTQForCausalLM.from_quantized
+    if quantize_config.model_file_base_name:
+        possible_model_basenames = [quantize_config.model_file_base_name]
+    else:
+        possible_model_basenames = [
+            f"gptq_model-{quantize_config.bits}bit-{quantize_config.group_size}g",
+            "model",
+        ]
+
+    extensions = []
+    if use_safetensors:
+        extensions.append(".safetensors")
+    else:
+        extensions += [".bin", ".pt"]
+
+    if exllama_config is None:
+        exllama_config = {"version": ExllamaVersion.TWO}
+    else:
+        if "version" not in exllama_config:
+            raise ValueError("`exllama_config` needs to have a `version` key")
+        elif exllama_config["version"] not in [ExllamaVersion.ONE, ExllamaVersion.TWO]:
+            version = exllama_config["version"]
+            raise ValueError(
+                f"Only supported versions are in [ExllamaVersion.ONE, ExllamaVersion.TWO] - not recognized version {version}"
+            )
+
+    from auto_gptq.utils.marlin_utils import (
+        _validate_marlin_compatibility,
+        prepare_model_for_marlin_load,
+    )
+    from auto_gptq.modeling._utils import (
+        make_sure_no_tensor_in_meta_device, 
+        get_checkpoints
+    )
+
+    # Retrieve (and if necessary download) the quantized checkpoint(s).
+    is_sharded, model_save_name, true_model_basename = get_checkpoints(
+        model_name_or_path=model_name_or_path, 
+        extensions=extensions, 
+        possible_model_basenames=possible_model_basenames, 
+        **cached_file_kwargs
+    )
+
+    if offload_state_dict is not None:
+        raise ValueError("The offloading of state dict with Marlin is currently not supported. Please raise an issue in AutoGPTQ repository.")
+    if is_sharded:
+        raise ValueError("The loading of sharded checkpoints with Marlin is currently not supported. Please raise an issue in AutoGPTQ repository.")
+    if torch.version.hip:
+        raise ValueError("Can not use Marlin int4*fp16 kernel with AMD ROCm version of PyTorch as the kernel is not compatible. Please do not use `use_marlin=True` when using ROCm devices.")
+    if not torch.cuda.get_device_capability()[0] >= 8:
+        raise ValueError(f'Can not use Marlin int4*fp16 kernel with a device of compute capability {torch.cuda.get_device_capability()}, the minimum compute capability is 8.0 for Marlin kernel. Please do not use `use_marlin=True`, or please upgrade your GPU ("The more you buy, the more you save." - Taiwanese proverb).')
+
+    # Validate the model can run in Marlin.
+    if torch_dtype != torch.float16:
+        raise ValueError("Marlin kernel requires torch_dtype=torch.float16.")
+
+    # validate the quantization configurations
+    unsupported_reason = _validate_marlin_compatibility(quantize_config)
+    if unsupported_reason is not None:
+        raise ValueError(
+            # f"The model {model_name_or_path} can not be converted to use the Marlin kernel for the following reason: {unsupported_reason}, which is not supported by Marlin kernel."
+            f"The model can not be converted to use the Marlin kernel for the following reason: {unsupported_reason}, which is not supported by Marlin kernel."
+        )
+
+    # HF loads quantized models in meta tensors. This line is taken from the auto-gptq
+    # package, but not absolutely sure if needed
+    # should this be done in 
+    make_sure_no_tensor_in_meta_device(
+        model,
+        False,
+        quantize_config.desc_act,
+        quantize_config.group_size,
+        bits=quantize_config.bits,
+        disable_exllama=disable_exllama or exllama_config['version'] != ExllamaVersion.ONE,
+        disable_exllamav2=disable_exllama or exllama_config['version'] != ExllamaVersion.TWO,
+    )
+
+    # prepare the quant linear type that has been installed in the modl
+    # NOTE: this code is repeated in _replace_by_quant_layers below.
+    #       consider collecting in single location.
+    quant_linear_class = dynamically_import_QuantLinear(
+        use_triton=False,
+        desc_act=quantize_config.desc_act,
+        group_size=quantize_config.group_size,
+        bits=quantize_config.bits,
+        disable_exllama=disable_exllama or exllama_config['version'] != ExllamaVersion.ONE,
+        disable_exllamav2=disable_exllama or exllama_config['version'] != ExllamaVersion.TWO,
+        disable_marlin=True,  # Get the "original" QuantLienar class
+    )
+
+    # Prepare model for marlin load.
+    #   If stub is marlin serialzed         --> load from directly
+    #   If stub has cached marlin version   --> load from the cached versin
+    #   Otherwise                           --> convert to marlin, cache, load from cache
+    model, model_save_name = prepare_model_for_marlin_load(
+        model_name_or_path=model_name_or_path,
+        model=model,
+        quantize_config=quantize_config,
+        quant_linear_class=quant_linear_class,
+        torch_dtype=torch.float16,
+        current_model_save_name=model_save_name,
+        device_map=device_map,
+    )
+
+    # because HF loads quantized model with meta tensors, the workspace tensor
+    # created in the prepare_model_for_marlin_load call above, needs to be concretely
+    # realized, otherwise will face problems later on when being moved to device.
+    for mod in model.modules():
+        if hasattr(mod, 'workspace') and mod.workspace.is_meta:
+            mod.workspace = torch.zeros_like(mod.workspace, device='cpu')
+
+    import accelerate.utils.modeling
+    accelerate.utils.modeling.load_checkpoint_in_model(
+        model,
+        dtype=torch.float16,  # This is very hacky but works due to https://github.com/huggingface/accelerate/blob/bd72a5f1a80d5146554458823f8aeda0a9db5297/src/accelerate/utils/modeling.py#L292
+        checkpoint=model_save_name,
+        device_map=device_map,
+        offload_state_dict=offload_state_dict,
+        offload_buffers=True,
+    )
+
+    offload_index = None # only support his now, see above
+
+    return model, offload_index

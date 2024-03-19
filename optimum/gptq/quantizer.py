@@ -955,7 +955,4 @@ def replace_marlin_linear_and_load_checkpoint(
         offload_state_dict=offload_state_dict,
         offload_buffers=True,
     )
-
-    offload_index = None # only support his now, see above
-
-    return model, offload_index
+    return model
